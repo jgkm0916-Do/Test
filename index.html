@@ -436,6 +436,7 @@
         <div class="btn-row">
           <button class="btn blue" id="calibrateBtn">1. 기준 설정</button>
           <button class="btn primary" id="startSessionBtn" disabled>2. 세션 시작</button>
+          <button onclick="saveTest()">Firebase 테스트</button>
         </div>
       </div>
 
@@ -538,7 +539,32 @@
   </div>
 
   <div class="toast" id="toast"></div>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.1.0/firebase-app.js";
+import { getFirestore, collection, addDoc } from "https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js";
 
+const firebaseConfig = {
+  apiKey: "AIzaSyDtYOZOUULbCYgNb6CHxIIJHftn6LLfXWM",
+  authDomain: "ergofix-test.firebaseapp.com",
+  projectId: "ergofix-test",
+  storageBucket: "ergofix-test.firebasestorage.app",
+  messagingSenderId: "906504249938",
+  appId: "1:906504249938:web:047a1c9fa3ea2f8051758b"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+// 테스트 함수
+window.saveTest = async () => {
+  await addDoc(collection(db, "test"), {
+    score: 80,
+    time: new Date()
+  });
+  alert("저장 완료!");
+};
+</script>
+  
   <script type="module">
     import {
       PoseLandmarker,
