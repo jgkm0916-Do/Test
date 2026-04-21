@@ -112,6 +112,7 @@
       font-size:18px;
       font-weight:800;
       margin-bottom:15px;
+      line-height:1.4;
     }
     .time-row{
       display:grid;
@@ -672,9 +673,9 @@
     function buildGuideText(){
       if(isPreparing) return "기준 자세 준비";
       if(isCalibrating) return "기준 자세 측정 중";
-      if(frontLikeRejected) return "측면이 더 보이게 몸을 조금 돌려주세요.";
-      if(!lastTrack) return "귀 옆선과 어깨가 화면 안에 보이게 맞춰 주세요";
-      if(!baseline) return "자세가 인식되었습니다. 기준 설정을 눌러주세요.";
+      if(frontLikeRejected) return "측면이 더 보이게 몸통까지 조금 더 돌려주세요.";
+      if(!lastTrack) return "얼굴만 말고 귀와 어깨가 함께 보이도록 상반신을 조금 더 뒤로 물러나 주세요";
+      if(!baseline) return "자세가 인식되었습니다. 그대로 유지한 뒤 기준 설정을 눌러주세요.";
 
       if(currentRiskState === "danger") return "고개를 뒤로 당겨주세요!";
       if(currentRiskState === "warning") return "주의: 고개가 조금 앞으로 나와 있어요.";
@@ -777,11 +778,11 @@
       if(isPreparing || isCalibrating) return;
 
       if(frontLikeRejected){
-        showToast("측면이 더 보이게 몸을 돌린 뒤 다시 시도해 주세요.");
+        showToast("측면이 더 보이게 몸통까지 조금 더 돌린 뒤 다시 시도해 주세요.");
         return;
       }
       if(!lastTrack){
-        showToast("자세 인식이 불안정합니다. 측면을 비춰주세요.");
+        showToast("자세 인식이 불안정합니다. 귀와 어깨가 같이 보이게 맞춰주세요.");
         return;
       }
 
@@ -830,11 +831,11 @@
     function finishCalibration(){
       hideCountOverlay();
 
-      if(calibrationSamples.length < 12){
+      if(calibrationSamples.length < 10){
         isCalibrating = false;
         updateGuide();
         updateButtons();
-        showToast("기준 자세 설정에 실패했습니다. 다시 시도해 주세요.");
+        showToast("기준 자세 설정에 실패했습니다. 조금 더 옆으로 돌리고 다시 시도해 주세요.");
         return;
       }
 
@@ -867,8 +868,8 @@
       const delta = Math.max(0, track.rawForwardNorm - baseline.rawForwardNorm);
 
       let fhpScore = 0;
-      if(delta > 0.015){
-        fhpScore = ((delta - 0.015) / (0.10 - 0.015)) * 100;
+      if(delta > 0.012){
+        fhpScore = ((delta - 0.012) / (0.09 - 0.012)) * 100;
       }
       riskScore = clamp(fhpScore, 0, 100);
 
@@ -918,7 +919,7 @@
         return;
       }
       if(frontLikeRejected){
-        showToast("측면이 더 보이게 몸을 돌린 뒤 시작해 주세요.");
+        showToast("측면이 더 보이게 몸통까지 조금 더 돌린 뒤 시작해 주세요.");
         return;
       }
       if(timeOptions[selectedIndex] !== 1){
@@ -1198,13 +1199,33 @@
       const rightShoulder = lm[12];
       const leftEye = lm[2];
       const rightEye = lm[5];
+      const leftEar = lm[7];
+      const rightEar = lm[8];
 
       if(!leftShoulder || !rightShoulder || !leftEye || !rightEye) return false;
 
       const shoulderSpan = Math.abs(leftShoulder.x - rightShoulder.x);
       const eyeSpan = Math.abs(leftEye.x - rightEye.x);
 
-      return shoulderSpan > 0.18 && eyeSpan > 0.06;
+      const leftEarVisible = !!leftEar && (leftEar.visibility ?? 0) > 0.55;
+      const rightEarVisible = !!rightEar && (rightEar.visibility ?? 0) > 0.55;
+
+      const bothShouldersStrong =
+        (leftShoulder.visibility ?? 0) > 0.65 &&
+        (rightShoulder.visibility ?? 0) > 0.65;
+
+      const bothEyesStrong =
+        (leftEye.visibility ?? 0) > 0.60 &&
+        (rightEye.visibility ?? 0) > 0.60;
+
+      return (
+        bothShouldersStrong &&
+        bothEyesStrong &&
+        shoulderSpan > 0.24 &&
+        eyeSpan > 0.085 &&
+        leftEarVisible &&
+        rightEarVisible
+      );
     }
 
     function extractNeckTrack(lm){
@@ -1221,15 +1242,25 @@
         const neckHeight = Math.abs(leftShoulder.y - leftEar.y);
         const rawForwardNorm = Math.abs(leftEar.x - leftShoulder.x) / Math.max(neckHeight, 0.0001);
         const d = dist(leftEar, leftShoulder);
-        if(neckHeight > 0.05 && d > 0.08){
+
+        const leftEarVis = leftEar.visibility ?? 0;
+        const leftShoulderVis = leftShoulder.visibility ?? 0;
+        const leftEyeVis = leftEye?.visibility ?? 0;
+
+        if(
+          neckHeight > 0.035 &&
+          d > 0.06 &&
+          leftEarVis > 0.35 &&
+          leftShoulderVis > 0.45 &&
+          !(leftEye && leftEyeVis > 0.75 && Math.abs(leftEar.x - leftEye.x) < 0.025 && Math.abs(leftEar.y - leftEye.y) < 0.04)
+        ){
           candidates.push({
             ear:leftEar,
-            eye:leftEye,
             shoulder:leftShoulder,
             neckHeight,
             rawForwardNorm,
             isRightSide:false,
-            score:(leftEar.visibility || 0) + (leftShoulder.visibility || 0)
+            score:(leftEarVis * 1.1) + (leftShoulderVis * 1.4) + (leftEyeVis * 0.3)
           });
         }
       }
@@ -1238,15 +1269,25 @@
         const neckHeight = Math.abs(rightShoulder.y - rightEar.y);
         const rawForwardNorm = Math.abs(rightEar.x - rightShoulder.x) / Math.max(neckHeight, 0.0001);
         const d = dist(rightEar, rightShoulder);
-        if(neckHeight > 0.05 && d > 0.08){
+
+        const rightEarVis = rightEar.visibility ?? 0;
+        const rightShoulderVis = rightShoulder.visibility ?? 0;
+        const rightEyeVis = rightEye?.visibility ?? 0;
+
+        if(
+          neckHeight > 0.035 &&
+          d > 0.06 &&
+          rightEarVis > 0.35 &&
+          rightShoulderVis > 0.45 &&
+          !(rightEye && rightEyeVis > 0.75 && Math.abs(rightEar.x - rightEye.x) < 0.025 && Math.abs(rightEar.y - rightEye.y) < 0.04)
+        ){
           candidates.push({
             ear:rightEar,
-            eye:rightEye,
             shoulder:rightShoulder,
             neckHeight,
             rawForwardNorm,
             isRightSide:true,
-            score:(rightEar.visibility || 0) + (rightShoulder.visibility || 0)
+            score:(rightEarVis * 1.1) + (rightShoulderVis * 1.4) + (rightEyeVis * 0.3)
           });
         }
       }
