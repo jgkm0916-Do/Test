@@ -1,0 +1,2134 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
+
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_mlkit_commons/google_mlkit_commons.dart';
+import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
+
+late final List<CameraDescription> gCameras;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+  ]);
+  gCameras = await availableCameras();
+  runApp(const ErgofixApp());
+}
+
+class ErgofixApp extends StatelessWidget {
+  const ErgofixApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Ergofix',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1FB77A),
+        ),
+        useMaterial3: true,
+      ),
+      home: const ErgofixPage(),
+    );
+  }
+}
+
+enum RiskState { safe, warning, danger }
+
+class SessionResult {
+  final int measuredSeconds;
+  final int dangerSeconds;
+  final double dangerRate;
+  final int score;
+
+  const SessionResult({
+    required this.measuredSeconds,
+    required this.dangerSeconds,
+    required this.dangerRate,
+    required this.score,
+  });
+}
+
+class CalibrationProfile {
+  final double rawForwardNorm;
+
+  const CalibrationProfile({
+    required this.rawForwardNorm,
+  });
+}
+
+class NeckTrack {
+  final Offset ear;
+  final Offset shoulder;
+  final double rawForwardNorm;
+  final double neckHeight;
+  final bool isRightSide;
+
+  const NeckTrack({
+    required this.ear,
+    required this.shoulder,
+    required this.rawForwardNorm,
+    required this.neckHeight,
+    required this.isRightSide,
+  });
+}
+
+class ErgofixPage extends StatefulWidget {
+  const ErgofixPage({super.key});
+
+  @override
+  State<ErgofixPage> createState() => _ErgofixPageState();
+}
+
+class _ErgofixPageState extends State<ErgofixPage>
+    with WidgetsBindingObserver {
+  final PoseDetector _poseDetector = PoseDetector(
+    options: PoseDetectorOptions(
+      model: PoseDetectionModel.base,
+      mode: PoseDetectionMode.stream,
+    ),
+  );
+
+  CameraController? _controller;
+  CameraLensDirection _lensDirection = CameraLensDirection.front;
+
+  bool _isInitializing = true;
+  bool _isProcessing = false;
+  bool _isDisposed = false;
+
+  Size _absoluteImageSize = Size.zero;
+  InputImageRotation _inputImageRotation = InputImageRotation.rotation0deg;
+
+  NeckTrack? _lastTrack;
+  CalibrationProfile? _baseline;
+
+  bool _frontLikeRejected = false;
+  bool _isPreparing = false;
+  bool _isCalibrating = false;
+  bool _isSessionActive = false;
+  bool _showResultView = false;
+
+  double _riskScore = 0.0;
+  RiskState _currentRiskState = RiskState.safe;
+  RiskState? _pendingRiskState;
+  DateTime? _pendingRiskSince;
+
+  String _guideText = '카메라 준비 중입니다';
+
+  static const int _prepDurationSec = 5;
+  static const int _measureDurationSec = 3;
+  int _prepSeconds = _prepDurationSec;
+  int _measureSeconds = _measureDurationSec;
+
+  static const int _minCalibrationSamples = 12;
+  final List<double> _calibrationSamples = [];
+
+  static const int _allowedMissedFrames = 6;
+  int _missedFrames = 0;
+
+  static const int _requiredStableTrackFrames = 3;
+  int _stableTrackFrames = 0;
+
+  bool? _lockedSideIsRight;
+  int _lostLockedSideFrames = 0;
+  static const int _allowedLostLockedSideFrames = 6;
+
+  final List<int> _timeOptions = [1, 10, 30, 60];
+  int _selectedIndex = 0;
+  int _sessionDurationSec = 60;
+  int _elapsedSeconds = 0;
+  int _badPostureSeconds = 0;
+
+  Timer? _prepTimer;
+  Timer? _measureTimer;
+  Timer? _sessionTimer;
+
+  SessionResult? _lastSessionResult;
+
+  static const Duration _warningEnterHold = Duration(milliseconds: 600);
+  static const Duration _dangerEnterHold = Duration(milliseconds: 900);
+  static const Duration _recoverHold = Duration(milliseconds: 900);
+
+  final Map<DeviceOrientation, int> _orientations = {
+    DeviceOrientation.portraitUp: 0,
+    DeviceOrientation.landscapeLeft: 90,
+    DeviceOrientation.portraitDown: 180,
+    DeviceOrientation.landscapeRight: 270,
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _initializeCamera(CameraLensDirection.front);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 새 PC 1차 테스트에서는 재초기화 비활성화
+  }
+
+  @override
+  void dispose() {
+    _isDisposed = true;
+    WidgetsBinding.instance.removeObserver(this);
+    _prepTimer?.cancel();
+    _measureTimer?.cancel();
+    _sessionTimer?.cancel();
+
+    final c = _controller;
+    if (c != null) {
+      if (c.value.isStreamingImages) {
+        c.stopImageStream().catchError((_) {});
+      }
+      c.dispose();
+    }
+
+    _poseDetector.close();
+    super.dispose();
+  }
+
+  Future<void> _initializeCamera(CameraLensDirection preferredLens) async {
+    try {
+      if (_isDisposed) return;
+
+      setState(() {
+        _isInitializing = true;
+      });
+
+      final oldController = _controller;
+      if (oldController != null) {
+        try {
+          if (oldController.value.isStreamingImages) {
+            await oldController.stopImageStream();
+          }
+        } catch (_) {}
+        await oldController.dispose();
+        _controller = null;
+      }
+
+      final desc = gCameras.firstWhere(
+        (c) => c.lensDirection == preferredLens,
+        orElse: () => gCameras.first,
+      );
+
+      final controller = CameraController(
+        desc,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: Platform.isAndroid
+            ? ImageFormatGroup.nv21
+            : ImageFormatGroup.bgra8888,
+      );
+
+      await controller.initialize();
+
+      if (!mounted || _isDisposed) {
+        await controller.dispose();
+        return;
+      }
+
+      _controller = controller;
+      _lensDirection = desc.lensDirection;
+
+      if (!_controller!.value.isStreamingImages) {
+        await _controller!.startImageStream(_processCameraImage);
+      }
+
+      if (!mounted || _isDisposed) return;
+
+      setState(() {
+        _isInitializing = false;
+        _guideText = '귀 옆선과 어깨가 보이게 맞춰 주세요';
+      });
+    } catch (e) {
+      if (!mounted || _isDisposed) return;
+      setState(() {
+        _isInitializing = false;
+        _guideText = '카메라 오류: $e';
+      });
+    }
+  }
+
+  Future<void> _switchCamera() async {
+    final nextLens = _lensDirection == CameraLensDirection.front
+        ? CameraLensDirection.back
+        : CameraLensDirection.front;
+    await _initializeCamera(nextLens);
+    _resetCalibration();
+  }
+
+  void _resetCalibration() {
+    _prepTimer?.cancel();
+    _measureTimer?.cancel();
+    _sessionTimer?.cancel();
+    _calibrationSamples.clear();
+
+    _lockedSideIsRight = null;
+    _lostLockedSideFrames = 0;
+    _pendingRiskState = null;
+    _pendingRiskSince = null;
+    _frontLikeRejected = false;
+    _stableTrackFrames = 0;
+    _missedFrames = 0;
+
+    setState(() {
+      _baseline = null;
+      _lastTrack = null;
+      _riskScore = 0.0;
+      _currentRiskState = RiskState.safe;
+      _guideText = '귀 옆선과 어깨가 보이게 맞춰 주세요';
+
+      _isPreparing = false;
+      _isCalibrating = false;
+      _prepSeconds = _prepDurationSec;
+      _measureSeconds = _measureDurationSec;
+
+      _isSessionActive = false;
+      _elapsedSeconds = 0;
+      _badPostureSeconds = 0;
+
+      _showResultView = false;
+      _lastSessionResult = null;
+    });
+  }
+
+  InputImage? _inputImageFromCameraImage(CameraImage image) {
+    final controller = _controller;
+    if (controller == null) return null;
+
+    final camera = controller.description;
+    final sensorOrientation = camera.sensorOrientation;
+
+    InputImageRotation? rotation;
+    if (Platform.isIOS) {
+      rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
+    } else {
+      int? rotationCompensation =
+          _orientations[controller.value.deviceOrientation];
+      if (rotationCompensation == null) return null;
+
+      if (camera.lensDirection == CameraLensDirection.front) {
+        rotationCompensation =
+            (sensorOrientation + rotationCompensation) % 360;
+      } else {
+        rotationCompensation =
+            (sensorOrientation - rotationCompensation + 360) % 360;
+      }
+
+      rotation =
+          InputImageRotationValue.fromRawValue(rotationCompensation);
+    }
+
+    final format = InputImageFormatValue.fromRawValue(image.format.raw);
+    if (rotation == null || format == null || image.planes.isEmpty) {
+      return null;
+    }
+
+    _absoluteImageSize = Size(
+      image.width.toDouble(),
+      image.height.toDouble(),
+    );
+    _inputImageRotation = rotation;
+
+    return InputImage.fromBytes(
+      bytes: image.planes.first.bytes,
+      metadata: InputImageMetadata(
+        size: _absoluteImageSize,
+        rotation: rotation,
+        format: format,
+        bytesPerRow: image.planes.first.bytesPerRow,
+      ),
+    );
+  }
+
+  Future<void> _processCameraImage(CameraImage image) async {
+    if (_isProcessing || _isDisposed || _showResultView) return;
+    _isProcessing = true;
+
+    try {
+      final inputImage = _inputImageFromCameraImage(image);
+      if (inputImage == null) return;
+
+      final poses = await _poseDetector.processImage(inputImage);
+      if (!mounted || _isDisposed) return;
+
+      if (poses.isEmpty) {
+        _stableTrackFrames = 0;
+        _missedFrames++;
+        if (_missedFrames >= _allowedMissedFrames) {
+          _handleNoPose();
+        }
+      } else {
+        final pose = poses.first;
+
+        if (_isFrontalLike(pose)) {
+          _stableTrackFrames = 0;
+          _missedFrames = 0;
+          _handleFrontLike();
+          return;
+        }
+
+        _frontLikeRejected = false;
+        final rawTrack = _extractNeckTrack(pose);
+
+        if (rawTrack == null) {
+          _stableTrackFrames = 0;
+          _missedFrames++;
+          if (_missedFrames >= _allowedMissedFrames) {
+            _handleNoPose();
+          }
+        } else {
+          _missedFrames = 0;
+          _stableTrackFrames++;
+
+          if (_stableTrackFrames >= _requiredStableTrackFrames) {
+            _lastTrack = _smoothTrack(rawTrack);
+
+            if (_isCalibrating) {
+              _calibrationSamples.add(_lastTrack!.rawForwardNorm);
+            }
+
+            _updateRisk(_lastTrack!);
+
+            if (mounted) {
+              setState(() {
+                _guideText = _buildGuideText();
+              });
+            }
+          } else {
+            if (mounted) {
+              setState(() {
+                _guideText = '자세 확인 중...';
+              });
+            }
+          }
+        }
+      }
+    } finally {
+      _isProcessing = false;
+    }
+  }
+
+  void _handleNoPose() {
+    _lastTrack = null;
+    _lockedSideIsRight = null;
+    _lostLockedSideFrames = 0;
+    _frontLikeRejected = false;
+    _pendingRiskState = null;
+    _pendingRiskSince = null;
+    _stableTrackFrames = 0;
+
+    setState(() {
+      _guideText = '인식이 불안정합니다. 측면이 잘 보이게 맞춰주세요.';
+      _riskScore = 0.0;
+      _currentRiskState = RiskState.safe;
+    });
+  }
+
+  void _handleFrontLike() {
+    _lastTrack = null;
+    _lockedSideIsRight = null;
+    _lostLockedSideFrames = 0;
+    _frontLikeRejected = true;
+    _pendingRiskState = null;
+    _pendingRiskSince = null;
+    _stableTrackFrames = 0;
+
+    setState(() {
+      _guideText = '측면이 더 보이게 몸을 조금 돌려주세요.';
+      _riskScore = 0.0;
+      _currentRiskState = RiskState.safe;
+    });
+  }
+
+  double _lik(PoseLandmark? p) => p?.likelihood ?? 0.0;
+
+  bool _landmarkInImage(PoseLandmark? p) {
+    if (p == null || _absoluteImageSize == Size.zero) return false;
+    return p.x >= 0 &&
+        p.x <= _absoluteImageSize.width &&
+        p.y >= 0 &&
+        p.y <= _absoluteImageSize.height;
+  }
+
+  double _sideScore(
+    PoseLandmark? shoulder,
+    PoseLandmark? ear,
+    PoseLandmark? eye,
+  ) {
+    return (_lik(shoulder) * 1.8) + (_lik(ear) * 1.0) + (_lik(eye) * 0.6);
+  }
+
+  bool _earLooksValid(
+    PoseLandmark ear,
+    PoseLandmark? eye,
+    PoseLandmark shoulder,
+  ) {
+    final dy = (shoulder.y - ear.y).abs();
+    final dist = math.sqrt(
+      math.pow(ear.x - shoulder.x, 2) + math.pow(ear.y - shoulder.y, 2),
+    );
+
+    if (dy < 14.0) return false;
+    if (dist < 30.0) return false;
+
+    if (eye != null && _landmarkInImage(eye) && eye.likelihood > 0.35) {
+      final dxEye = (ear.x - eye.x).abs();
+      final dyEye = (ear.y - eye.y).abs();
+      if (dxEye < 10.0 && dyEye < 14.0) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  bool _isFrontalLike(Pose pose) {
+    final l = pose.landmarks;
+
+    final leftShoulder = l[PoseLandmarkType.leftShoulder];
+    final rightShoulder = l[PoseLandmarkType.rightShoulder];
+    final leftEye = l[PoseLandmarkType.leftEye];
+    final rightEye = l[PoseLandmarkType.rightEye];
+
+    final bothShouldersStrong = _landmarkInImage(leftShoulder) &&
+        _landmarkInImage(rightShoulder) &&
+        _lik(leftShoulder) > 0.50 &&
+        _lik(rightShoulder) > 0.50;
+
+    final bothEyesStrong = _landmarkInImage(leftEye) &&
+        _landmarkInImage(rightEye) &&
+        _lik(leftEye) > 0.40 &&
+        _lik(rightEye) > 0.40;
+
+    if (!bothShouldersStrong || !bothEyesStrong) return false;
+
+    final shoulderSpanNorm =
+        (leftShoulder!.x - rightShoulder!.x).abs() / _absoluteImageSize.width;
+
+    final leftScore = _sideScore(
+      leftShoulder,
+      pose.landmarks[PoseLandmarkType.leftEar],
+      leftEye,
+    );
+    final rightScore = _sideScore(
+      rightShoulder,
+      pose.landmarks[PoseLandmarkType.rightEar],
+      rightEye,
+    );
+
+    final scoreGap = (leftScore - rightScore).abs();
+
+    return shoulderSpanNorm > 0.18 && scoreGap < 0.30;
+  }
+
+  NeckTrack? _extractNeckTrack(Pose pose) {
+    final l = pose.landmarks;
+
+    final leftEar = l[PoseLandmarkType.leftEar];
+    final rightEar = l[PoseLandmarkType.rightEar];
+    final leftEye = l[PoseLandmarkType.leftEye];
+    final rightEye = l[PoseLandmarkType.rightEye];
+    final leftShoulder = l[PoseLandmarkType.leftShoulder];
+    final rightShoulder = l[PoseLandmarkType.rightShoulder];
+
+    final leftOk = _landmarkInImage(leftEar) &&
+        _landmarkInImage(leftShoulder) &&
+        _lik(leftEar) > 0.22 &&
+        _lik(leftShoulder) > 0.40;
+
+    final rightOk = _landmarkInImage(rightEar) &&
+        _landmarkInImage(rightShoulder) &&
+        _lik(rightEar) > 0.22 &&
+        _lik(rightShoulder) > 0.40;
+
+    if (!leftOk && !rightOk) {
+      _lostLockedSideFrames++;
+      if (_lostLockedSideFrames >= _allowedLostLockedSideFrames) {
+        _lockedSideIsRight = null;
+      }
+      return null;
+    }
+
+    final leftScore = _sideScore(leftShoulder, leftEar, leftEye);
+    final rightScore = _sideScore(rightShoulder, rightEar, rightEye);
+
+    bool useRight;
+
+    if (_lockedSideIsRight != null) {
+      if (_lockedSideIsRight == true && rightOk) {
+        useRight = true;
+        _lostLockedSideFrames = 0;
+      } else if (_lockedSideIsRight == false && leftOk) {
+        useRight = false;
+        _lostLockedSideFrames = 0;
+      } else {
+        _lostLockedSideFrames++;
+        if (_lostLockedSideFrames < _allowedLostLockedSideFrames) {
+          return null;
+        }
+
+        _lockedSideIsRight = null;
+        _lostLockedSideFrames = 0;
+
+        if (rightOk && leftOk) {
+          useRight = rightScore >= leftScore;
+        } else if (rightOk) {
+          useRight = true;
+        } else {
+          useRight = false;
+        }
+
+        _lockedSideIsRight = useRight;
+      }
+    } else {
+      if (rightOk && leftOk) {
+        useRight = rightScore >= leftScore;
+      } else if (rightOk) {
+        useRight = true;
+      } else {
+        useRight = false;
+      }
+
+      _lockedSideIsRight = useRight;
+      _lostLockedSideFrames = 0;
+    }
+
+    final ear = useRight ? rightEar! : leftEar!;
+    final eye = useRight ? rightEye : leftEye;
+    final shoulder = useRight ? rightShoulder! : leftShoulder!;
+
+    if (!_earLooksValid(ear, eye, shoulder)) {
+      return null;
+    }
+
+    final neckHeight = (shoulder.y - ear.y).abs();
+    if (neckHeight < 16.0) return null;
+
+    final rawForwardNorm = (ear.x - shoulder.x).abs() / neckHeight;
+
+    return NeckTrack(
+      ear: Offset(ear.x, ear.y),
+      shoulder: Offset(shoulder.x, shoulder.y),
+      rawForwardNorm: rawForwardNorm,
+      neckHeight: neckHeight,
+      isRightSide: useRight,
+    );
+  }
+
+  NeckTrack _smoothTrack(NeckTrack current) {
+    final prev = _lastTrack;
+    if (prev == null) return current;
+
+    const alpha = 0.28;
+
+    return NeckTrack(
+      ear: Offset(
+        prev.ear.dx * (1 - alpha) + current.ear.dx * alpha,
+        prev.ear.dy * (1 - alpha) + current.ear.dy * alpha,
+      ),
+      shoulder: Offset(
+        prev.shoulder.dx * (1 - alpha) + current.shoulder.dx * alpha,
+        prev.shoulder.dy * (1 - alpha) + current.shoulder.dy * alpha,
+      ),
+      rawForwardNorm:
+          prev.rawForwardNorm * (1 - alpha) + current.rawForwardNorm * alpha,
+      neckHeight:
+          prev.neckHeight * (1 - alpha) + current.neckHeight * alpha,
+      isRightSide: current.isRightSide,
+    );
+  }
+
+  Duration _holdForTransition(RiskState from, RiskState to) {
+    if (to.index > from.index) {
+      if (to == RiskState.warning) return _warningEnterHold;
+      if (to == RiskState.danger) return _dangerEnterHold;
+    }
+    return _recoverHold;
+  }
+
+  void _updateRisk(NeckTrack track) {
+    if (_baseline == null || _isCalibrating || _isPreparing) {
+      _riskScore = 0.0;
+      _currentRiskState = RiskState.safe;
+      _pendingRiskState = null;
+      _pendingRiskSince = null;
+      return;
+    }
+
+    final delta = math.max(
+      0.0,
+      track.rawForwardNorm - _baseline!.rawForwardNorm,
+    );
+
+    double fhpScore = 0.0;
+    if (delta > 0.015) {
+      fhpScore = ((delta - 0.015) / (0.10 - 0.015)) * 100.0;
+    }
+    _riskScore = fhpScore.clamp(0.0, 100.0);
+
+    RiskState candidate = _currentRiskState;
+
+    switch (_currentRiskState) {
+      case RiskState.safe:
+        if (_riskScore >= 60.0) {
+          candidate = RiskState.danger;
+        } else if (_riskScore >= 30.0) {
+          candidate = RiskState.warning;
+        }
+        break;
+
+      case RiskState.warning:
+        if (_riskScore >= 60.0) {
+          candidate = RiskState.danger;
+        } else if (_riskScore < 20.0) {
+          candidate = RiskState.safe;
+        }
+        break;
+
+      case RiskState.danger:
+        if (_riskScore < 45.0) {
+          candidate =
+              _riskScore >= 20.0 ? RiskState.warning : RiskState.safe;
+        }
+        break;
+    }
+
+    if (candidate == _currentRiskState) {
+      _pendingRiskState = null;
+      _pendingRiskSince = null;
+      return;
+    }
+
+    final now = DateTime.now();
+
+    if (_pendingRiskState != candidate) {
+      _pendingRiskState = candidate;
+      _pendingRiskSince = now;
+      return;
+    }
+
+    final hold = _holdForTransition(_currentRiskState, candidate);
+
+    if (_pendingRiskSince != null &&
+        now.difference(_pendingRiskSince!) >= hold) {
+      _currentRiskState = candidate;
+      _pendingRiskState = null;
+      _pendingRiskSince = null;
+    }
+  }
+
+  void _startCalibrationFlow() {
+    if (_isCalibrating || _isPreparing) return;
+
+    _lockedSideIsRight = null;
+    _lostLockedSideFrames = 0;
+    _stableTrackFrames = 0;
+
+    if (_frontLikeRejected) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('측면이 더 보이게 몸을 돌린 뒤 다시 시도해 주세요.')),
+      );
+      return;
+    }
+
+    if (_lastTrack == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('자세 인식이 불안정합니다. 측면을 비춰주세요.')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isPreparing = true;
+      _isCalibrating = false;
+      _prepSeconds = _prepDurationSec;
+      _guideText = '기준 자세 준비';
+    });
+
+    _prepTimer?.cancel();
+    _prepTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+
+      if (_prepSeconds > 1) {
+        setState(() {
+          _prepSeconds--;
+        });
+      } else {
+        timer.cancel();
+        _startMeasurePhase();
+      }
+    });
+  }
+
+  void _startMeasurePhase() {
+    _calibrationSamples.clear();
+
+    setState(() {
+      _isPreparing = false;
+      _isCalibrating = true;
+      _measureSeconds = _measureDurationSec;
+      _guideText = '기준 자세 측정 중';
+      _riskScore = 0.0;
+    });
+
+    _measureTimer?.cancel();
+    _measureTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+
+      if (_measureSeconds > 1) {
+        setState(() {
+          _measureSeconds--;
+        });
+      } else {
+        timer.cancel();
+        _finishCalibration();
+      }
+    });
+  }
+
+  void _finishCalibration() {
+    if (!mounted) return;
+
+    if (_calibrationSamples.length < _minCalibrationSamples) {
+      setState(() {
+        _isCalibrating = false;
+        _guideText = '설정 실패: 인식이 불안정합니다. 다시 시도해 주세요.';
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('기준 자세 설정에 실패했습니다. 다시 시도해 주세요.')),
+      );
+      return;
+    }
+
+    final avg =
+        _calibrationSamples.reduce((a, b) => a + b) / _calibrationSamples.length;
+
+    setState(() {
+      _baseline = CalibrationProfile(rawForwardNorm: avg);
+      _isCalibrating = false;
+      _guideText = '기준 자세가 설정되었습니다.';
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('기준 자세가 설정되었습니다. 세션을 시작할 수 있습니다.')),
+    );
+  }
+
+  void _startSession() {
+    if (_baseline == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('먼저 기준 자세를 설정해주세요.')),
+      );
+      return;
+    }
+
+    if (_frontLikeRejected) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('측면이 더 보이게 몸을 돌린 뒤 시작해 주세요.')),
+      );
+      return;
+    }
+
+    if (_timeOptions[_selectedIndex] != 1) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('데모 버전에서는 1분 세션만 지원합니다.')),
+      );
+      return;
+    }
+
+    setState(() {
+      _sessionDurationSec = _timeOptions[_selectedIndex] * 60;
+      _isSessionActive = true;
+      _elapsedSeconds = 0;
+      _badPostureSeconds = 0;
+      _showResultView = false;
+      _lastSessionResult = null;
+    });
+
+    _sessionTimer?.cancel();
+    _sessionTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted || !_isSessionActive) return;
+
+      bool shouldFinish = false;
+
+      setState(() {
+        _elapsedSeconds++;
+        if (_currentRiskState == RiskState.danger) {
+          _badPostureSeconds++;
+        }
+        if (_elapsedSeconds >= _sessionDurationSec) {
+          shouldFinish = true;
+        }
+      });
+
+      if (shouldFinish) {
+        _finishSession();
+      }
+    });
+  }
+
+  void _stopSession({bool showResult = false}) {
+    _sessionTimer?.cancel();
+
+    final measuredSeconds = _elapsedSeconds;
+
+    setState(() {
+      _isSessionActive = false;
+    });
+
+    if (!showResult) return;
+
+    if (measuredSeconds < 1) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('1초 이상 측정 후 종료해 주세요.')),
+      );
+      return;
+    }
+
+    final dangerRate = (measuredSeconds == 0)
+        ? 0.0
+        : (_badPostureSeconds / measuredSeconds) * 100.0;
+
+    final rawScore = 100 - dangerRate.round();
+    final score = rawScore < 0 ? 0 : (rawScore > 100 ? 100 : rawScore);
+
+    setState(() {
+      _lastSessionResult = SessionResult(
+        measuredSeconds: measuredSeconds,
+        dangerSeconds: _badPostureSeconds,
+        dangerRate: dangerRate,
+        score: score,
+      );
+      _showResultView = true;
+    });
+  }
+
+  void _finishSession() {
+    _stopSession(showResult: true);
+  }
+
+  String _buildGuideText() {
+    if (_isPreparing) return '기준 자세 준비';
+    if (_isCalibrating) return '기준 자세 측정 중';
+    if (_frontLikeRejected) return '측면이 더 보이게 몸을 조금 돌려주세요.';
+    if (_lastTrack == null) return '귀 옆선과 어깨가 화면 안에 보이게 맞춰 주세요';
+    if (_baseline == null) return '자세가 인식되었습니다. 기준 설정을 눌러주세요.';
+
+    switch (_currentRiskState) {
+      case RiskState.danger:
+        return '고개를 뒤로 당겨주세요!';
+      case RiskState.warning:
+        return '주의: 고개가 조금 앞으로 나와 있어요.';
+      case RiskState.safe:
+        return '안전: 양호한 자세입니다!';
+    }
+  }
+
+  Color get _statusColor {
+    if (_frontLikeRejected) return const Color(0xFF4A9DFF);
+    if (_lastTrack == null || _baseline == null) return const Color(0xFF4A9DFF);
+    if (_isPreparing) return const Color(0xFF4A9DFF);
+    if (_isCalibrating) return const Color(0xFFFFA726);
+
+    switch (_currentRiskState) {
+      case RiskState.danger:
+        return const Color(0xFFFF4B3A);
+      case RiskState.warning:
+        return const Color(0xFFFFA726);
+      case RiskState.safe:
+        return const Color(0xFF1FB77A);
+    }
+  }
+
+  String _formatMeasuredTime(int seconds) {
+    final int m = seconds ~/ 60;
+    final int s = seconds % 60;
+    return '$m분 ${s.toString().padLeft(2, '0')}초';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_showResultView && _lastSessionResult != null) {
+      return _buildResultView(_lastSessionResult!);
+    }
+
+    final controller = _controller;
+    final progress = _sessionDurationSec == 0
+        ? 0.0
+        : _elapsedSeconds / _sessionDurationSec;
+    final isDanger =
+        _isSessionActive && _currentRiskState == RiskState.danger;
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: _isInitializing ||
+                controller == null ||
+                !controller.value.isInitialized
+            ? const Center(child: CircularProgressIndicator())
+            : Stack(
+                fit: StackFit.expand,
+                children: [
+                  _buildCameraPreview(controller),
+
+                  if (_lastTrack != null)
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: CustomPaint(
+                          painter: NeckPainter(
+                            track: _lastTrack!,
+                            absoluteImageSize: _absoluteImageSize,
+                            rotation: _inputImageRotation,
+                            mirrorPreview:
+                                _lensDirection == CameraLensDirection.front,
+                            statusColor: _statusColor,
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  _buildCenterCountdownOverlay(),
+
+                  if (isDanger)
+                    IgnorePointer(
+                      child: Container(
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: Colors.red.withOpacity(0.8),
+                            width: 12,
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  if (_isSessionActive)
+                    Positioned(
+                      top: 0,
+                      left: 0,
+                      right: 0,
+                      child: LinearProgressIndicator(
+                        value: progress,
+                        minHeight: 8,
+                        backgroundColor: Colors.grey[300],
+                        color: _statusColor,
+                      ),
+                    ),
+
+                  Positioned(
+                    top: 12,
+                    left: 16,
+                    right: 16,
+                    child: _buildTopBar(),
+                  ),
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: _buildBottomCard(),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+
+  Widget _buildCameraPreview(CameraController controller) {
+    final previewSize = controller.value.previewSize;
+    if (previewSize == null) return const SizedBox.shrink();
+
+    Widget preview = CameraPreview(controller);
+
+    if (_lensDirection == CameraLensDirection.front) {
+      preview = Transform(
+        alignment: Alignment.center,
+        transform: Matrix4.rotationY(math.pi),
+        child: preview,
+      );
+    }
+
+    return SizedBox.expand(
+      child: ClipRect(
+        child: FittedBox(
+          fit: BoxFit.cover,
+          child: SizedBox(
+            width: previewSize.height,
+            height: previewSize.width,
+            child: preview,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopBar() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        const SizedBox(width: 48),
+        const Text(
+          'Ergofix',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 26,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        IconButton(
+          onPressed: _switchCamera,
+          icon: const Icon(Icons.cameraswitch, color: Colors.white),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCenterCountdownOverlay() {
+    if (!_isPreparing && !_isCalibrating) return const SizedBox.shrink();
+
+    final isPrep = _isPreparing;
+    final title = isPrep ? '기준 자세 준비' : '기준 자세 측정 중';
+    final number = isPrep ? '$_prepSeconds' : '$_measureSeconds';
+    final line1 = isPrep
+        ? '어깨 힘을 빼고, 턱을 살짝 당겨 주세요'
+        : '지금의 편안한 작업자세를 기준으로 저장합니다';
+    final line2 = isPrep
+        ? '허리를 억지로 세우지 말고 편안하게 맞춰 주세요'
+        : '움직이지 말고 잠시만 유지해 주세요';
+
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Container(
+          color: Colors.black.withOpacity(0.35),
+          child: Center(
+            child: Container(
+              margin: const EdgeInsets.symmetric(horizontal: 28),
+              padding: const EdgeInsets.fromLTRB(24, 28, 24, 24),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.96),
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xFF1F1F1F),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    number,
+                    style: TextStyle(
+                      fontSize: 68,
+                      fontWeight: FontWeight.w900,
+                      color: isPrep
+                          ? const Color(0xFF4A9DFF)
+                          : const Color(0xFFFFA726),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    line1,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF2F2F2F),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    line2,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 14,
+                      color: Color(0xFF5A5A5A),
+                      height: 1.4,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBottomCard() {
+    final startDisabled = _baseline == null ||
+        _isPreparing ||
+        _isCalibrating ||
+        _lastTrack == null;
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 30),
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(30)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            _guideText,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: _statusColor,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 15),
+          if (!_isSessionActive) ...[
+            Row(
+              children: List.generate(_timeOptions.length, (index) {
+                final isSelected = _selectedIndex == index;
+                final isAvailable = _timeOptions[index] == 1;
+                final disabled = _isPreparing || _isCalibrating;
+
+                return Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: InkWell(
+                      onTap: (!isAvailable || disabled)
+                          ? null
+                          : () => setState(() => _selectedIndex = index),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: isSelected
+                              ? const Color(0xFF1FB77A)
+                              : (isAvailable
+                                  ? Colors.grey[200]
+                                  : Colors.grey[100]),
+                          borderRadius: BorderRadius.circular(15),
+                        ),
+                        child: Text(
+                          isAvailable
+                              ? '${_timeOptions[index]}분'
+                              : '${_timeOptions[index]}분\n(예정)',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: isSelected
+                                ? Colors.white
+                                : (isAvailable
+                                    ? Colors.black54
+                                    : Colors.grey[400]),
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }),
+            ),
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: (_isPreparing || _isCalibrating)
+                        ? null
+                        : (_baseline == null
+                            ? _startCalibrationFlow
+                            : _resetCalibration),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _baseline == null
+                          ? const Color(0xFF4A9DFF)
+                          : Colors.grey[400],
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                    icon: Icon(
+                      _baseline == null
+                          ? Icons.center_focus_strong
+                          : Icons.refresh,
+                      size: 18,
+                    ),
+                    label: Text(
+                      (_isPreparing || _isCalibrating)
+                          ? '설정 중...'
+                          : (_baseline == null ? '1. 기준 설정' : '기준 재설정'),
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: startDisabled ? null : _startSession,
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF1FB77A),
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                    icon: const Icon(Icons.play_arrow, size: 18),
+                    label: const Text(
+                      '2. 세션 시작',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ] else ...[
+            Text(
+              '${(_sessionDurationSec - _elapsedSeconds) ~/ 60}:${((_sessionDurationSec - _elapsedSeconds) % 60).toString().padLeft(2, '0')}',
+              style: const TextStyle(
+                fontSize: 48,
+                fontWeight: FontWeight.bold,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: () => _stopSession(showResult: true),
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFFFF4B3A),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+                icon: const Icon(Icons.stop, size: 20),
+                label: const Text(
+                  '세션 종료',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildResultView(SessionResult result) {
+    return Scaffold(
+      backgroundColor: Colors.grey[100],
+      appBar: AppBar(
+        title: const Text(
+          '세션 완료',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.close),
+          onPressed: () {
+            setState(() {
+              _showResultView = false;
+            });
+          },
+        ),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(20.0),
+        child: Column(
+          children: [
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(24),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.05),
+                    blurRadius: 10,
+                  ),
+                ],
+              ),
+              child: Column(
+                children: [
+                  const Text(
+                    '오늘의 세션 리포트',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.black87,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Text(
+                    '총 측정 시간: ${_formatMeasuredTime(result.measuredSeconds)}',
+                    style: const TextStyle(fontSize: 15, color: Colors.black54),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      Column(
+                        children: [
+                          Text(
+                            '${result.score}점',
+                            style: const TextStyle(
+                              fontSize: 40,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF1FB77A),
+                            ),
+                          ),
+                          const Text(
+                            '거북목 관리 점수',
+                            style: TextStyle(color: Colors.grey),
+                          ),
+                        ],
+                      ),
+                      Container(width: 1, height: 50, color: Colors.grey[300]),
+                      Column(
+                        children: [
+                          Text(
+                            '${result.dangerRate.toStringAsFixed(1)}%',
+                            style: const TextStyle(
+                              fontSize: 40,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFFFF4B3A),
+                            ),
+                          ),
+                          const Text(
+                            '위험 자세 노출률',
+                            style: TextStyle(color: Colors.grey),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(24),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE8F5E9),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.lightbulb, color: Colors.orange),
+                      SizedBox(width: 8),
+                      Text(
+                        'AI 맞춤 솔루션',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    '현재 위험 자세 노출률은 ${result.dangerRate.toStringAsFixed(1)}%입니다.\n다음 세션 전, 가볍게 목을 풀어보세요!',
+                    style: const TextStyle(
+                      color: Colors.black87,
+                      height: 1.5,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF1FB77A),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const RoutinePage(),
+                          ),
+                        );
+                      },
+                      child: const Text(
+                        '1분 루틴 시작',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton(
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => ReportPage(result: result),
+                          ),
+                        );
+                      },
+                      child: const Text(
+                        '개인 리포트 확인',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ReportPage extends StatelessWidget {
+  final SessionResult result;
+
+  const ReportPage({super.key, required this.result});
+
+  int _boundedInt(int value, int min, int max) {
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+  }
+
+  double _boundedDouble(double value, double min, double max) {
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scoreData = <int>[
+      _boundedInt(result.score - 10, 55, 95),
+      _boundedInt(result.score - 6, 55, 95),
+      _boundedInt(result.score - 8, 55, 95),
+      _boundedInt(result.score - 4, 55, 95),
+      _boundedInt(result.score - 2, 55, 95),
+      _boundedInt(result.score + 1, 55, 95),
+      _boundedInt(result.score, 55, 95),
+    ];
+
+    final rateData = <double>[
+      _boundedDouble(result.dangerRate + 8.0, 5.0, 65.0),
+      _boundedDouble(result.dangerRate + 5.0, 5.0, 65.0),
+      _boundedDouble(result.dangerRate + 6.5, 5.0, 65.0),
+      _boundedDouble(result.dangerRate + 3.5, 5.0, 65.0),
+      _boundedDouble(result.dangerRate + 2.0, 5.0, 65.0),
+      _boundedDouble(result.dangerRate - 1.0, 5.0, 65.0),
+      _boundedDouble(result.dangerRate, 5.0, 65.0),
+    ];
+
+    const labels = ['월', '화', '수', '목', '금', '토', '오늘'];
+
+    return Scaffold(
+      backgroundColor: Colors.grey[50],
+      appBar: AppBar(
+        title: const Text(
+          '개인 리포트',
+          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black),
+        ),
+        backgroundColor: Colors.white,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.black),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '오늘의 측정 결과',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.05),
+                    blurRadius: 10,
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  Column(
+                    children: [
+                      Text(
+                        '${result.score}점',
+                        style: const TextStyle(
+                          fontSize: 32,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF1FB77A),
+                        ),
+                      ),
+                      const Text('관리 점수', style: TextStyle(color: Colors.grey)),
+                    ],
+                  ),
+                  Container(width: 1, height: 40, color: Colors.grey[300]),
+                  Column(
+                    children: [
+                      Text(
+                        '${result.dangerRate.toStringAsFixed(1)}%',
+                        style: const TextStyle(
+                          fontSize: 32,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.redAccent,
+                        ),
+                      ),
+                      const Text('위험 노출률', style: TextStyle(color: Colors.grey)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 30),
+            const Text(
+              '최근 7일 추이 (점수)',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 10),
+            Container(
+              height: 220,
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.05),
+                    blurRadius: 10,
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: List.generate(labels.length, (i) {
+                  final isToday = i == labels.length - 1;
+                  return Column(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      Text(
+                        '${scoreData[i]}',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: isToday
+                              ? const Color(0xFF1FB77A)
+                              : Colors.grey,
+                          fontWeight:
+                              isToday ? FontWeight.bold : FontWeight.normal,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Container(
+                        width: 24,
+                        height: scoreData[i] * 1.2,
+                        decoration: BoxDecoration(
+                          color: isToday
+                              ? const Color(0xFF1FB77A)
+                              : Colors.grey[300],
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        labels[i],
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: isToday ? Colors.black : Colors.grey,
+                          fontWeight:
+                              isToday ? FontWeight.bold : FontWeight.normal,
+                        ),
+                      ),
+                    ],
+                  );
+                }),
+              ),
+            ),
+            const SizedBox(height: 30),
+            const Text(
+              '최근 7일 추이 (위험 노출률)',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.05),
+                    blurRadius: 10,
+                  ),
+                ],
+              ),
+              child: Column(
+                children: List.generate(labels.length, (i) {
+                  final isToday = i == labels.length - 1;
+                  return Padding(
+                    padding: EdgeInsets.only(
+                      bottom: i == labels.length - 1 ? 0 : 12,
+                    ),
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: 28,
+                          child: Text(
+                            labels[i],
+                            style: TextStyle(
+                              fontWeight:
+                                  isToday ? FontWeight.bold : FontWeight.normal,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(999),
+                            child: LinearProgressIndicator(
+                              minHeight: 10,
+                              value: rateData[i] / 100,
+                              backgroundColor: Colors.grey[200],
+                              color: isToday
+                                  ? const Color(0xFFFF4B3A)
+                                  : Colors.grey[400],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        SizedBox(
+                          width: 52,
+                          child: Text(
+                            '${rateData[i].toStringAsFixed(1)}%',
+                            textAlign: TextAlign.right,
+                            style: TextStyle(
+                              color: isToday
+                                  ? const Color(0xFFFF4B3A)
+                                  : Colors.black54,
+                              fontWeight:
+                                  isToday ? FontWeight.bold : FontWeight.normal,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }),
+              ),
+            ),
+            const SizedBox(height: 30),
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE8F5E9),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: const Color(0xFF1FB77A)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.lightbulb, color: Colors.orange),
+                      SizedBox(width: 8),
+                      Text(
+                        '다음 목표',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '현재 위험 자세 노출률이 ${result.dangerRate.toStringAsFixed(1)}%입니다.\n다음 세션에서는 20% 미만으로 줄여보세요!',
+                    style: const TextStyle(color: Colors.black87, height: 1.4),
+                  ),
+                  const SizedBox(height: 15),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF1FB77A),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const RoutinePage(),
+                          ),
+                        );
+                      },
+                      child: const Text(
+                        '거북목 1분 리셋 루틴 시작하기',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class RoutinePage extends StatefulWidget {
+  const RoutinePage({super.key});
+
+  @override
+  State<RoutinePage> createState() => _RoutinePageState();
+}
+
+class _RoutinePageState extends State<RoutinePage> {
+  int _remainingSeconds = 60;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) return;
+      if (_remainingSeconds > 0) {
+        setState(() {
+          _remainingSeconds--;
+        });
+      } else {
+        timer.cancel();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  String get _timerText {
+    final m = _remainingSeconds ~/ 60;
+    final s = _remainingSeconds % 60;
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = (60 - _remainingSeconds) / 60;
+
+    return Scaffold(
+      backgroundColor: Colors.grey[50],
+      appBar: AppBar(
+        title: const Text(
+          '거북목 1분 리셋',
+          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black),
+        ),
+        backgroundColor: Colors.white,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.black),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(24),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(18),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.05),
+                    blurRadius: 10,
+                  ),
+                ],
+              ),
+              child: Column(
+                children: [
+                  const Icon(
+                    Icons.self_improvement,
+                    size: 56,
+                    color: Color(0xFF1FB77A),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    '1분 리셋 루틴',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    '목과 어깨 긴장을 잠깐 풀어주는 루틴입니다.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.black54),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    _timerText,
+                    style: const TextStyle(
+                      fontSize: 42,
+                      fontWeight: FontWeight.w900,
+                      color: Color(0xFF1FB77A),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(999),
+                    child: LinearProgressIndicator(
+                      value: progress,
+                      minHeight: 10,
+                      backgroundColor: Colors.grey[200],
+                      color: const Color(0xFF1FB77A),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 24),
+            _step('1', '턱을 살짝 당기고 뒤통수를 위로 길게 세웁니다.'),
+            const SizedBox(height: 16),
+            _step('2', '어깨 힘을 빼고 가슴을 부드럽게 열어 주세요.'),
+            const SizedBox(height: 16),
+            _step('3', '10초 유지 후 천천히 힘을 풀고 3회 반복합니다.'),
+            const Spacer(),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                onPressed: () => Navigator.pop(context),
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFF1FB77A),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+                child: Text(
+                  _remainingSeconds == 0 ? '루틴 완료' : '루틴 종료',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _step(String n, String text) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        CircleAvatar(
+          radius: 14,
+          backgroundColor: const Color(0xFF1FB77A),
+          child: Text(
+            n,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Text(
+            text,
+            style: const TextStyle(fontSize: 16, height: 1.4),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class NeckPainter extends CustomPainter {
+  final NeckTrack track;
+  final Size absoluteImageSize;
+  final InputImageRotation rotation;
+  final bool mirrorPreview;
+  final Color statusColor;
+
+  const NeckPainter({
+    required this.track,
+    required this.absoluteImageSize,
+    required this.rotation,
+    required this.mirrorPreview,
+    required this.statusColor,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (absoluteImageSize == Size.zero) return;
+
+    final ear = _translate(
+      track.ear.dx,
+      track.ear.dy,
+      size,
+      absoluteImageSize,
+      rotation,
+      mirrorPreview,
+    );
+
+    final shoulder = _translate(
+      track.shoulder.dx,
+      track.shoulder.dy,
+      size,
+      absoluteImageSize,
+      rotation,
+      mirrorPreview,
+    );
+
+    bool onCanvas(Offset p) {
+      return p.dx >= -24 &&
+          p.dx <= size.width + 24 &&
+          p.dy >= -24 &&
+          p.dy <= size.height + 24;
+    }
+
+    if (!onCanvas(ear) || !onCanvas(shoulder)) {
+      return;
+    }
+
+    final linePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 4.0
+      ..color = statusColor;
+
+    final pointPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = Colors.white;
+
+    final guidePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0
+      ..color = Colors.white.withOpacity(0.5);
+
+    canvas.drawCircle(ear, 6.0, pointPaint);
+    canvas.drawCircle(shoulder, 6.0, pointPaint);
+    canvas.drawLine(ear, shoulder, linePaint);
+    canvas.drawLine(
+      shoulder,
+      Offset(shoulder.dx, math.max(0.0, shoulder.dy - 80.0)),
+      guidePaint,
+    );
+  }
+
+  Offset _translate(
+    double x,
+    double y,
+    Size canvasSize,
+    Size imageSize,
+    InputImageRotation rotation,
+    bool mirrorPreview,
+  ) {
+    double rx;
+    double ry;
+    double rotatedImageWidth;
+    double rotatedImageHeight;
+
+    switch (rotation) {
+      case InputImageRotation.rotation0deg:
+        rx = x;
+        ry = y;
+        rotatedImageWidth = imageSize.width;
+        rotatedImageHeight = imageSize.height;
+        break;
+      case InputImageRotation.rotation90deg:
+        rx = y;
+        ry = imageSize.width - x;
+        rotatedImageWidth = imageSize.height;
+        rotatedImageHeight = imageSize.width;
+        break;
+      case InputImageRotation.rotation180deg:
+        rx = imageSize.width - x;
+        ry = imageSize.height - y;
+        rotatedImageWidth = imageSize.width;
+        rotatedImageHeight = imageSize.height;
+        break;
+      case InputImageRotation.rotation270deg:
+        rx = imageSize.height - y;
+        ry = x;
+        rotatedImageWidth = imageSize.height;
+        rotatedImageHeight = imageSize.width;
+        break;
+    }
+
+    final scale = math.max(
+      canvasSize.width / rotatedImageWidth,
+      canvasSize.height / rotatedImageHeight,
+    );
+
+    final fittedWidth = rotatedImageWidth * scale;
+    final fittedHeight = rotatedImageHeight * scale;
+
+    final dx = (canvasSize.width - fittedWidth) / 2.0;
+    final dy = (canvasSize.height - fittedHeight) / 2.0;
+
+    double px = (rx * scale) + dx;
+    final py = (ry * scale) + dy;
+
+    if (mirrorPreview) {
+      px = canvasSize.width - px;
+    }
+
+    return Offset(px, py);
+  }
+
+  @override
+  bool shouldRepaint(covariant NeckPainter oldDelegate) {
+    return oldDelegate.track != track ||
+        oldDelegate.absoluteImageSize != absoluteImageSize ||
+        oldDelegate.rotation != rotation ||
+        oldDelegate.mirrorPreview != mirrorPreview ||
+        oldDelegate.statusColor != statusColor;
+  }
+}9
