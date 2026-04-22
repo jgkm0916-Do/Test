@@ -555,20 +555,20 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 // 버튼 클릭 시 Firebase 저장
-document.getElementById("calibrateBtn").addEventListener("click", async () => {
+async function saveSessionToFirebase(result) {
   try {
     await addDoc(collection(db, "sessions"), {
-      posture: "good",
-      time: new Date().toISOString()
+      score: result.score,
+      dangerRate: Number(result.dangerRate.toFixed(1)),
+      measuredSeconds: result.measuredSeconds,
+      dangerSeconds: result.dangerSeconds,
+      createdAt: new Date().toISOString()
     });
-
-    alert("🔥 Firebase 저장 성공");
   } catch (e) {
-    console.error(e);
-    alert("저장 실패");
+    console.error("Firebase 저장 실패:", e);
+    alert("세션 결과 저장 실패");
   }
-});  
-
+}
 // 테스트 함수
 window.saveTest = async () => {
   await addDoc(collection(db, "test"), {
@@ -1000,7 +1000,7 @@ window.saveTest = async () => {
       updateButtons();
     }
 
-    function stopSession(showResult = false){
+    async function stopSession(showResult = false){
       clearInterval(sessionTimer);
       isSessionActive = false;
       dangerBorder.style.display = "none";
@@ -1029,20 +1029,22 @@ window.saveTest = async () => {
       score = clamp(score, 0, 100);
 
       resultData = {
-        measuredSeconds,
-        dangerSeconds: badPostureSeconds,
-        dangerRate,
-        score
-      };
+  measuredSeconds,
+  dangerSeconds: badPostureSeconds,
+  dangerRate,
+  score
+};
 
-      openResult();
-      updateGuide();
-      updateButtons();
+await saveSessionToFirebase(resultData);
+
+openResult();
+updateGuide();
+updateButtons();;
     }
 
-    function finishSession(){
-      stopSession(true);
-    }
+    async function finishSession(){
+  await stopSession(true);
+}
 
     function boundedInt(value, min, max){
       return Math.max(min, Math.min(max, value));
