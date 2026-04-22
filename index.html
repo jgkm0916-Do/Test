@@ -436,7 +436,7 @@
         <div class="btn-row">
           <button class="btn blue" id="calibrateBtn">1. 기준 설정</button>
           <button class="btn primary" id="startSessionBtn" disabled>2. 세션 시작</button>
-          <button onclick="saveTest()">Firebase 테스트</button>
+         
         </div>
       </div>
 
@@ -570,13 +570,7 @@ async function saveSessionToFirebase(result) {
   }
 }
 // 테스트 함수
-window.saveTest = async () => {
-  await addDoc(collection(db, "test"), {
-    score: 80,
-    time: new Date()
-  });
-  alert("저장 완료!");
-};
+
 </script>
   
   <script type="module">
