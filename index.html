@@ -554,6 +554,20 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
+// 버튼 클릭 시 Firebase 저장
+document.getElementById("calibrateBtn").addEventListener("click", async () => {
+  try {
+    await addDoc(collection(db, "sessions"), {
+      posture: "good",
+      time: new Date().toISOString()
+    });
+
+    alert("🔥 Firebase 저장 성공");
+  } catch (e) {
+    console.error(e);
+    alert("저장 실패");
+  }
+});  
 
 // 테스트 함수
 window.saveTest = async () => {
